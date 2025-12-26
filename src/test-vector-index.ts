@@ -31,7 +31,6 @@ async function main() {
   // Create cache and add some sample data
   const cache = new SemanticCache(db, {
     similarityThreshold: 0.85,
-    nProbe: 10,
   });
 
   // Clear and repopulate for testing

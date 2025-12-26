@@ -3,7 +3,6 @@
  */
 
 import { Database, aql } from 'arangojs';
-import type { SemanticCacheConfig, DEFAULT_CONFIG } from './types';
 
 const {
   ARANGODB_URL,
@@ -148,14 +147,20 @@ export async function getCacheStats(db: Database): Promise<{
   avgHitCount: number;
 }> {
   const statsQuery = aql`
-    LET queries = (FOR q IN ${db.collection(COLLECTIONS.queries)} COLLECT WITH COUNT INTO c RETURN c)[0]
-    LET results = (FOR r IN ${db.collection(COLLECTIONS.results)} COLLECT WITH COUNT INTO c RETURN c)[0]
-    LET hits = (FOR q IN ${db.collection(COLLECTIONS.queries)} RETURN q.hit_count)
+    LET queryStats = (
+      FOR q IN ${db.collection(COLLECTIONS.queries)}
+        COLLECT AGGREGATE
+          count = COUNT(1),
+          totalHits = SUM(q.hit_count),
+          avgHits = AVERAGE(q.hit_count)
+        RETURN { count, totalHits, avgHits }
+    )[0]
+    LET resultCount = COUNT(FOR r IN ${db.collection(COLLECTIONS.results)} RETURN 1)
     RETURN {
-      queryCount: queries,
-      resultCount: results,
-      totalHits: SUM(hits),
-      avgHitCount: AVERAGE(hits)
+      queryCount: queryStats.count || 0,
+      resultCount: resultCount,
+      totalHits: queryStats.totalHits || 0,
+      avgHitCount: queryStats.avgHits || 0
     }
   `;
 
@@ -262,5 +267,34 @@ export async function evictOldEntries(
   `;
 
   const cursor = await db.query(evictQuery);
+  return (await cursor.next()) || 0;
+}
+
+/**
+ * Clean up orphaned query documents (queries without results).
+ * Results may be deleted by TTL index, leaving query docs behind.
+ * Run periodically to reclaim space and prevent stale vector matches.
+ */
+export async function cleanupOrphanedQueries(db: Database): Promise<number> {
+  const cleanupQuery = aql`
+    LET orphanedKeys = (
+      FOR q IN ${db.collection(COLLECTIONS.queries)}
+        LET hasResults = FIRST(
+          FOR r IN ${db.collection(COLLECTIONS.results)}
+            FILTER r.query_id == q._key
+            LIMIT 1
+            RETURN true
+        )
+        FILTER hasResults == null
+        RETURN q._key
+    )
+
+    FOR key IN orphanedKeys
+      REMOVE { _key: key } IN ${db.collection(COLLECTIONS.queries)}
+
+    RETURN LENGTH(orphanedKeys)
+  `;
+
+  const cursor = await db.query(cleanupQuery);
   return (await cursor.next()) || 0;
 }

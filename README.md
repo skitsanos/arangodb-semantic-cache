@@ -228,11 +228,10 @@ interface SemanticCacheConfig {
 
   // Multi-tenant isolation
   tenantId?: string;
-
-  // Vector search quality (set on index)
-  nProbe?: number;
 }
 ```
+
+> **Note:** Vector search quality (`nProbe`) is configured at the index level via `createVectorIndex()`, not in the cache config.
 
 ### TTL Presets
 
@@ -291,6 +290,7 @@ hasVectorIndex(db: Database): Promise<boolean>;
 // Maintenance
 getCacheStats(db: Database): Promise<CacheStats>;
 evictOldEntries(db: Database, maxAgeMs?: number): Promise<number>;
+cleanupOrphanedQueries(db: Database): Promise<number>;  // Remove queries without results
 ```
 
 ### Embeddings

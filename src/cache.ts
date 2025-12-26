@@ -9,8 +9,6 @@ import {
   embed,
   extractIntent,
   getModelRevision,
-  cosineSimilarity,
-  type EmbeddingModel,
 } from './embeddings';
 import {
   type SemanticCacheConfig,
@@ -58,12 +56,12 @@ export class SemanticCache {
     this.db = db;
     this.config = { ...DEFAULT_CONFIG, ...config };
     this.modelRev = getModelRevision(
-      this.config.embeddingModel as EmbeddingModel,
+      this.config.embeddingModel,
       this.config.rerankerModel
     );
   }
 
-  /** Find nearest cached query using cosine similarity */
+  /** Find nearest cached query using cosine similarity (only queries with valid results) */
   async findNearestQuery(
     queryVec: number[],
     tenantId?: string
@@ -71,27 +69,32 @@ export class SemanticCache {
     const queriesCol = this.db.collection(COLLECTIONS.queries);
     const resultsCol = this.db.collection(COLLECTIONS.results);
 
-    // nProbe controls search quality vs speed (set via index defaultNProbe)
-    // ArangoDB 3.12.4+ with vector index automatically uses indexed search
+    // Join queries with results to avoid orphaned query matches.
+    // The subquery uses idx_query_id (persistent) for efficient lookup.
+    // Vector index usage is unaffected by the join (verified via EXPLAIN).
     const searchQuery = tenantId
       ? aql`
           FOR q IN ${queriesCol}
             FILTER q.tenant_id == ${tenantId}
             FILTER q.q_vec != null
+            LET r = FIRST(FOR res IN ${resultsCol} FILTER res.query_id == q._key RETURN res)
+            FILTER r != null
             LET sim = COSINE_SIMILARITY(q.q_vec, ${queryVec})
             FILTER sim >= ${this.config.similarityThreshold}
             SORT sim DESC
             LIMIT 1
-            RETURN { query: q, similarity: sim }
+            RETURN { query: q, results: r, similarity: sim }
         `
       : aql`
           FOR q IN ${queriesCol}
             FILTER q.q_vec != null
+            LET r = FIRST(FOR res IN ${resultsCol} FILTER res.query_id == q._key RETURN res)
+            FILTER r != null
             LET sim = COSINE_SIMILARITY(q.q_vec, ${queryVec})
             FILTER sim >= ${this.config.similarityThreshold}
             SORT sim DESC
             LIMIT 1
-            RETURN { query: q, similarity: sim }
+            RETURN { query: q, results: r, similarity: sim }
         `;
 
     const cursor = await this.db.query(searchQuery);
@@ -99,19 +102,9 @@ export class SemanticCache {
 
     if (!match) return null;
 
-    // Fetch associated results
-    const resultsCursor = await this.db.query(aql`
-      FOR r IN ${resultsCol}
-        FILTER r.query_id == ${match.query._key}
-        LIMIT 1
-        RETURN r
-    `);
-
-    const results = await resultsCursor.next();
-
     return {
       query: match.query as QueryDocument,
-      results: results as QueryResultsDocument | null,
+      results: match.results as QueryResultsDocument,
       similarity: match.similarity,
     };
   }
@@ -172,13 +165,23 @@ export class SemanticCache {
     return queryKey;
   }
 
-  /** Update cached results for an existing query */
+  /** Update cached results for an existing query (uses default TTL) */
   async updateResults(
     queryKey: string,
     items: CacheItem[]
   ): Promise<void> {
+    await this.updateResultsWithIntent(queryKey, items);
+  }
+
+  /** Update cached results with proper intent-based TTL */
+  async updateResultsWithIntent(
+    queryKey: string,
+    items: CacheItem[],
+    intent?: ReturnType<typeof extractIntent>
+  ): Promise<void> {
     const resultsCol = this.db.collection(COLLECTIONS.results);
-    const intent = extractIntent(''); // Default intent for TTL calculation
+    // Use provided intent or default (preserves volatile query TTL)
+    const effectiveIntent = intent ?? { entities: [], facets: [], timebox: null };
 
     await this.db.query(aql`
       FOR r IN ${resultsCol}
@@ -186,7 +189,7 @@ export class SemanticCache {
         UPDATE r WITH {
           items: ${items.slice(0, this.config.topKCached)},
           model_rev: ${this.modelRev},
-          ttl_at: ${computeTtl(intent, this.config.defaultTtlMs)},
+          ttl_at: ${computeTtl(effectiveIntent, this.config.defaultTtlMs)},
           freshened_at: ${Date.now()}
         } IN ${resultsCol}
     `);
@@ -196,20 +199,23 @@ export class SemanticCache {
    * Main retrieval method - check cache first, fallback to fresh retrieval
    * @param query - User query text
    * @param retrieveFn - Function to perform fresh retrieval if cache miss
-   * @param tenantId - Optional tenant ID for multi-tenant caching
+   * @param tenantId - Optional tenant ID for multi-tenant caching (defaults to config.tenantId)
    */
   async retrieve(
     query: string,
     retrieveFn: (normalizedQuery: string, queryVec: number[]) => Promise<CacheItem[]>,
     tenantId?: string
   ): Promise<RetrievalResult> {
+    // Use config tenantId as default if not provided
+    const effectiveTenantId = tenantId ?? this.config.tenantId;
+
     // Normalize and embed the query
     const normalized = normalizeText(query);
-    const queryVec = await embed(normalized, this.config.embeddingModel as EmbeddingModel);
+    const queryVec = await embed(normalized, this.config.embeddingModel);
     const intent = extractIntent(query);
 
     // Check cache
-    const cached = await this.findNearestQuery(queryVec, tenantId);
+    const cached = await this.findNearestQuery(queryVec, effectiveTenantId);
 
     if (cached && cached.results) {
       // Validate cache entry
@@ -233,7 +239,7 @@ export class SemanticCache {
     const freshItems = await retrieveFn(normalized, queryVec);
 
     // Store in cache
-    const queryKey = await this.store(normalized, queryVec, freshItems, intent, tenantId);
+    const queryKey = await this.store(normalized, queryVec, freshItems, intent, effectiveTenantId);
 
     return {
       items: freshItems.slice(0, this.config.topKReturned),
@@ -244,31 +250,60 @@ export class SemanticCache {
 
   /**
    * Async refresh pattern - return cached results immediately,
-   * refresh in background if needed
+   * refresh in background if needed.
+   *
+   * Design note on similar-query refresh:
+   * When a similar (but not identical) query matches an expired or stale cache entry,
+   * we update the existing cached query's results rather than creating a new entry.
+   * This is intentional:
+   * - Similar queries are treated as semantically equivalent (above threshold)
+   * - The original query's vector continues to match similar future queries
+   * - Updating in-place prevents cache bloat from slight phrasings variations
+   * - The retrieval function receives the NEW query's text/vector for fresh results
+   * - Intent-based TTL is preserved from the original query for consistency
    */
   async retrieveWithBackgroundRefresh(
     query: string,
     retrieveFn: (normalizedQuery: string, queryVec: number[]) => Promise<CacheItem[]>,
     tenantId?: string
   ): Promise<RetrievalResult> {
+    // Use config tenantId as default if not provided
+    const effectiveTenantId = tenantId ?? this.config.tenantId;
+
     const normalized = normalizeText(query);
-    const queryVec = await embed(normalized, this.config.embeddingModel as EmbeddingModel);
+    const queryVec = await embed(normalized, this.config.embeddingModel);
     const intent = extractIntent(query);
 
-    const cached = await this.findNearestQuery(queryVec, tenantId);
+    const cached = await this.findNearestQuery(queryVec, effectiveTenantId);
 
     if (cached && cached.results) {
-      // Return cached immediately
+      const isModelMatch = cached.results.model_rev === this.modelRev;
+      const ttlTime = new Date(cached.results.ttl_at).getTime();
+      const now = Date.now();
+      const isExpired = ttlTime <= now;
+      const isApproachingExpiry = ttlTime - now < TTL_PRESETS.realtime;
+
+      // If expired, do NOT return stale data - treat as cache miss
+      if (isExpired) {
+        const freshItems = await retrieveFn(normalized, queryVec);
+        // Update existing cache entry, preserving original intent for consistent TTL
+        await this.updateResultsWithIntent(cached.query._key, freshItems, cached.query.intent);
+        await this.touchQuery(cached.query._key);
+
+        return {
+          items: freshItems.slice(0, this.config.topKReturned),
+          source: 'fresh',
+          query_id: cached.query._key,
+        };
+      }
+
+      // Not expired - return cached immediately
       await this.touchQuery(cached.query._key);
 
       // Check if refresh needed (model mismatch or approaching expiry)
-      const needsRefresh =
-        cached.results.model_rev !== this.modelRev ||
-        new Date(cached.results.ttl_at).getTime() - Date.now() < TTL_PRESETS.realtime;
-
-      if (needsRefresh) {
-        // Background refresh - fire and forget
-        this.backgroundRefresh(cached.query._key, normalized, queryVec, retrieveFn);
+      if (!isModelMatch || isApproachingExpiry) {
+        // Background refresh - fire and forget, preserve original intent
+        this.backgroundRefresh(cached.query._key, normalized, queryVec, retrieveFn, cached.query.intent);
       }
 
       return {
@@ -281,7 +316,7 @@ export class SemanticCache {
 
     // No cache - fresh retrieval
     const freshItems = await retrieveFn(normalized, queryVec);
-    const queryKey = await this.store(normalized, queryVec, freshItems, intent, tenantId);
+    const queryKey = await this.store(normalized, queryVec, freshItems, intent, effectiveTenantId);
 
     return {
       items: freshItems.slice(0, this.config.topKReturned),
@@ -290,43 +325,50 @@ export class SemanticCache {
     };
   }
 
-  /** Background refresh helper */
+  /** Background refresh helper - preserves original intent for correct TTL */
   private async backgroundRefresh(
     queryKey: string,
     normalized: string,
     queryVec: number[],
-    retrieveFn: (normalizedQuery: string, queryVec: number[]) => Promise<CacheItem[]>
+    retrieveFn: (normalizedQuery: string, queryVec: number[]) => Promise<CacheItem[]>,
+    originalIntent?: ReturnType<typeof extractIntent>
   ): Promise<void> {
     try {
       const freshItems = await retrieveFn(normalized, queryVec);
-      await this.updateResults(queryKey, freshItems);
+      await this.updateResultsWithIntent(queryKey, freshItems, originalIntent);
     } catch (err) {
       console.error('Background refresh failed:', err);
     }
   }
 
-  /** Get cache statistics */
+  /** Get cache statistics (uses aggregation, does not load all docs) */
   async getStats(): Promise<{
     totalQueries: number;
     totalHits: number;
     hitRate: number;
-    avgSimilarity: number;
   }> {
     const queriesCol = this.db.collection(COLLECTIONS.queries);
 
+    // Use COLLECT for efficient aggregation without loading all docs
     const cursor = await this.db.query(aql`
-      LET queries = (FOR q IN ${queriesCol} RETURN q)
-      LET total = LENGTH(queries)
-      LET hits = SUM(FOR q IN queries RETURN q.hit_count)
+      LET stats = (
+        FOR q IN ${queriesCol}
+          COLLECT AGGREGATE
+            total = COUNT(1),
+            hits = SUM(q.hit_count)
+          RETURN { total, hits }
+      )[0]
       RETURN {
-        totalQueries: total,
-        totalHits: hits,
-        hitRate: total > 0 ? (hits - total) / hits : 0
+        totalQueries: stats.total || 0,
+        totalHits: stats.hits || 0,
+        hitRate: (stats.total || 0) > 0 AND (stats.hits || 0) > 0
+          ? ((stats.hits - stats.total) / stats.hits)
+          : 0
       }
     `);
 
     const stats = await cursor.next();
-    return stats || { totalQueries: 0, totalHits: 0, hitRate: 0, avgSimilarity: 0 };
+    return stats || { totalQueries: 0, totalHits: 0, hitRate: 0 };
   }
 
   /** Invalidate cache entries by model revision */

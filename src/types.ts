@@ -2,6 +2,12 @@
  * Semantic Cache Types for Graph-RAG Pipeline
  */
 
+/** Supported embedding models */
+export type EmbeddingModelType =
+  | 'text-embedding-3-small'
+  | 'text-embedding-3-large'
+  | 'text-embedding-ada-002';
+
 /** Intent extracted from a query for analytics and fine-tuning */
 export interface QueryIntent {
   entities: string[];
@@ -63,7 +69,7 @@ export interface SemanticCacheConfig {
   /** Cosine similarity threshold (0.83-0.88 recommended) */
   similarityThreshold: number;
   /** Embedding model identifier */
-  embeddingModel: string;
+  embeddingModel: EmbeddingModelType;
   /** Reranker model identifier (optional) */
   rerankerModel?: string;
   /** Default TTL in milliseconds */
@@ -76,8 +82,6 @@ export interface SemanticCacheConfig {
   vectorDimension: number;
   /** Optional tenant ID for multi-tenant caching */
   tenantId?: string;
-  /** Number of neighboring centroids to search (higher = better but slower) */
-  nProbe?: number;
 }
 
 /** Default configuration values */

@@ -13,6 +13,7 @@ export {
   dropSemanticCache,
   getCacheStats,
   evictOldEntries,
+  cleanupOrphanedQueries,
   createVectorIndex,
   hasVectorIndex,
   COLLECTIONS,
@@ -36,6 +37,7 @@ export {
   GRAPH_NAME,
 } from './graph-rag';
 export * from './types';
+export type { EmbeddingModelType } from './types';
 
 // Demo / CLI usage
 import { createDatabase, setupSemanticCache, getCacheStats } from './db';

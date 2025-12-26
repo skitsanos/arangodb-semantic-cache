@@ -20,6 +20,9 @@ import {
 } from './embeddings';
 import type { CacheItem } from './types';
 
+// Check if OpenAI API key is available
+const hasOpenAIKey = !!process.env.OPENAI_API_KEY;
+
 // Test database connection
 let db: Database;
 let cache: SemanticCache;
@@ -111,20 +114,20 @@ describe('Cosine Similarity', () => {
 });
 
 describe('Embeddings', () => {
-  test('generates embeddings with correct dimension', async () => {
+  test.skipIf(!hasOpenAIKey)('generates embeddings with correct dimension', async () => {
     const embedding = await embed('test query');
     expect(embedding).toBeInstanceOf(Array);
     expect(embedding.length).toBe(1536); // text-embedding-3-small
   });
 
-  test('similar texts have high similarity', async () => {
+  test.skipIf(!hasOpenAIKey)('similar texts have high similarity', async () => {
     const e1 = await embed('iPhone price');
     const e2 = await embed('iPhone cost');
     const similarity = cosineSimilarity(e1, e2);
     expect(similarity).toBeGreaterThan(0.8);
   });
 
-  test('different texts have lower similarity', async () => {
+  test.skipIf(!hasOpenAIKey)('different texts have lower similarity', async () => {
     const e1 = await embed('iPhone price');
     const e2 = await embed('weather forecast');
     const similarity = cosineSimilarity(e1, e2);
@@ -140,7 +143,7 @@ describe('Semantic Cache', () => {
     ];
   };
 
-  test('stores and retrieves cached results', async () => {
+  test.skipIf(!hasOpenAIKey)('stores and retrieves cached results', async () => {
     // First query - should be fresh
     const result1 = await cache.retrieve('unique test query 12345', mockRetriever);
     expect(result1.source).toBe('fresh');
@@ -152,7 +155,7 @@ describe('Semantic Cache', () => {
     expect(result2.similarity).toBeCloseTo(1, 2);
   });
 
-  test('matches semantically similar queries', async () => {
+  test.skipIf(!hasOpenAIKey)('matches semantically similar queries', async () => {
     // Store a query
     await cache.retrieve('what is the weather today', mockRetriever);
 
@@ -164,13 +167,13 @@ describe('Semantic Cache', () => {
     }
   });
 
-  test('returns fresh for dissimilar queries', async () => {
+  test.skipIf(!hasOpenAIKey)('returns fresh for dissimilar queries', async () => {
     await cache.retrieve('apple iphone features', mockRetriever);
     const result = await cache.retrieve('banana nutrition facts', mockRetriever);
     expect(result.source).toBe('fresh');
   });
 
-  test('respects tenant isolation', async () => {
+  test.skipIf(!hasOpenAIKey)('respects tenant isolation', async () => {
     const tenantCache = new SemanticCache(db, {
       similarityThreshold: 0.85,
       tenantId: 'tenant-a',

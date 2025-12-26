@@ -32,11 +32,27 @@ ArangoDB 3.12.4+ with `--vector-index` startup option is enabled.
 ```aql
 FOR q IN sc_queries
   FILTER q.q_vec != null
+  LET r = FIRST(FOR res IN sc_results FILTER res.query_id == q._key RETURN res)
+  FILTER r != null  -- Only match queries with valid results (avoids orphans)
   LET sim = COSINE_SIMILARITY(q.q_vec, @queryVec)
   FILTER sim >= 0.85
   SORT sim DESC
   LIMIT 1
-  RETURN q
+  RETURN { query: q, results: r, similarity: sim }
+```
+
+> **Note:** The subquery join uses `idx_query_id` (persistent index) for efficient lookup. Vector index usage is unaffected by the join (verified via EXPLAIN).
+
+### Orphan Cleanup
+
+Results may be deleted by TTL index, leaving query documents behind. Use `cleanupOrphanedQueries()` periodically:
+
+```typescript
+import { cleanupOrphanedQueries } from './src';
+
+// Run via cron or scheduled job
+const removed = await cleanupOrphanedQueries(db);
+console.log(`Cleaned up ${removed} orphaned queries`);
 ```
 
 ### When Vector Index Is Used

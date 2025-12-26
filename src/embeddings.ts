@@ -3,18 +3,19 @@
  */
 
 import OpenAI from 'openai';
-import type { QueryIntent } from './types';
+import type { QueryIntent, EmbeddingModelType } from './types';
 
 const openai = new OpenAI();
 
 /** Embedding model configurations */
-export const EMBEDDING_MODELS = {
+export const EMBEDDING_MODELS: Record<EmbeddingModelType, { dimension: number }> = {
   'text-embedding-3-small': { dimension: 1536 },
   'text-embedding-3-large': { dimension: 3072 },
   'text-embedding-ada-002': { dimension: 1536 },
-} as const;
+};
 
-export type EmbeddingModel = keyof typeof EMBEDDING_MODELS;
+/** @deprecated Use EmbeddingModelType from types.ts */
+export type EmbeddingModel = EmbeddingModelType;
 
 /** Normalize query text for consistent caching */
 export function normalizeText(text: string): string {
@@ -29,7 +30,7 @@ export function normalizeText(text: string): string {
 /** Generate embedding for text using OpenAI */
 export async function embed(
   text: string,
-  model: EmbeddingModel = 'text-embedding-3-small'
+  model: EmbeddingModelType = 'text-embedding-3-small'
 ): Promise<number[]> {
   const response = await openai.embeddings.create({
     model,
@@ -43,7 +44,7 @@ export async function embed(
 /** Batch embed multiple texts */
 export async function embedBatch(
   texts: string[],
-  model: EmbeddingModel = 'text-embedding-3-small'
+  model: EmbeddingModelType = 'text-embedding-3-small'
 ): Promise<number[][]> {
   if (texts.length === 0) return [];
 
@@ -132,7 +133,7 @@ export function extractIntent(text: string): QueryIntent {
 
 /** Generate model revision string for cache invalidation */
 export function getModelRevision(
-  embeddingModel: EmbeddingModel,
+  embeddingModel: EmbeddingModelType,
   rerankerModel?: string
 ): string {
   const parts = [`embed:${embeddingModel}`];
